@@ -1,0 +1,1 @@
+{"grants":{"*":{"demo-calc":["tools:read"]},"alice":{"demo-calc":["tools:read","tools:write"]}},"servers":{"demo-calc":{"command":["python3","demo/server.py"],"default_scopes":["tools:read"],"description":"Demo calculator MCP server"}}}
