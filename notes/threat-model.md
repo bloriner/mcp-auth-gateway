@@ -48,9 +48,20 @@ plain code flow server-side, where the client secret already protects
 the exchange).
 
 ### 8. Session cookie theft
-**Mitigated:** cookies are HMAC-signed and HttpOnly; theft only yields
+**Mitigated:** cookies are HMAC-signed and HttpOnly; the `Secure` flag
+is set whenever the gateway's public base URL is HTTPS, so the cookie
+never travels in the clear on a real deploy. Theft only yields
 token-minting ability within the session TTL, and minted tokens are
 still policy-bounded. Future: bind sessions to IP/User-Agent.
+
+### 10. Concurrent request/response mix-up (fixed 2026-10-15)
+Each upstream stdio server is a single request/response stream, but the
+process pool used to write and read outside any lock: under concurrent
+load, callers reliably received *each other's* responses — a cross-user
+data leak. **Fixed:** one lock per server is now held for the whole
+write+read cycle (regression test:
+`TestUpstreamPoolIsolation.test_concurrent_calls_never_swap_responses`).
+Different servers still run in parallel.
 
 ### 9. Upstream impersonation of the gateway
 An attacker who can reach the upstream stdio server directly bypasses
