@@ -48,6 +48,19 @@ def _b64d(data: str) -> bytes:
         raise TokenError("malformed", "token is not valid base64url") from exc
 
 
+def _safe_compare(a: str, b: str) -> bool:
+    """Constant-time MAC comparison that fails closed.
+
+    ``hmac.compare_digest`` raises ``TypeError`` on non-ASCII ``str``
+    input (and on type mismatches); an attacker-controlled signature
+    segment must never turn into a 500 — it is simply not equal.
+    """
+    try:
+        return hmac.compare_digest(a, b)
+    except TypeError:
+        return False
+
+
 def _sign(secret: str, signing_input: str) -> str:
     mac = hmac.new(secret.encode("utf-8"), signing_input.encode("ascii"), hashlib.sha256)
     return _b64e(mac.digest())
@@ -93,7 +106,7 @@ def validate_token(secret: str, token: str, now: float | None = None) -> dict:
     if header.get("alg") != "HS256":
         raise TokenError("malformed", "unsupported alg")
     expected = _sign(secret, header_b64 + "." + body_b64)
-    if not hmac.compare_digest(expected, sig):
+    if not _safe_compare(expected, sig):
         raise TokenError("bad_signature", "signature mismatch")
     try:
         payload = json.loads(_b64d(body_b64))
@@ -103,10 +116,24 @@ def validate_token(secret: str, token: str, now: float | None = None) -> dict:
         raise TokenError("malformed", "bad token payload") from exc
     if not isinstance(payload, dict) or payload.get("v") != 1:
         raise TokenError("malformed", "bad payload version")
+    # Fail closed on unexpected claim types. The signature covers the
+    # payload, so a well-formed gateway can only mint the right types —
+    # anything else is corruption or a confused deputy, never valid.
     now_i = int(now if now is not None else time.time())
-    if payload.get("exp", 0) <= now_i:
+    # No clock-skew leeway: expiry is fail-closed. Operators should run
+    # NTP; a token used at exp <= now is rejected.
+    exp = payload.get("exp")
+    if not isinstance(exp, int) or isinstance(exp, bool) or exp <= now_i:
         raise TokenError("expired", "token has expired")
-    for field in ("sub", "srv", "scp", "iat"):
-        if field not in payload:
-            raise TokenError("malformed", "missing field: %s" % field)
+    iat = payload.get("iat")
+    if not isinstance(iat, int) or isinstance(iat, bool):
+        raise TokenError("malformed", "bad iat")
+    if not isinstance(payload.get("sub"), str) or not payload["sub"]:
+        raise TokenError("malformed", "bad sub")
+    if not isinstance(payload.get("srv"), str) or not payload["srv"]:
+        raise TokenError("malformed", "bad srv")
+    scp = payload.get("scp")
+    if (not isinstance(scp, list) or not scp
+            or not all(isinstance(s, str) for s in scp)):
+        raise TokenError("malformed", "bad scp")
     return payload

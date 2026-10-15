@@ -48,6 +48,10 @@ def main(argv=None) -> int:
     if not secret:
         print("error: set --secret or GATEWAY_SECRET", file=sys.stderr)
         return 2
+    if any(a == "--secret" or a.startswith("--secret=") for a in sys.argv[1:]):
+        # the secret is visible to other users via `ps`; env var is safer
+        print("warning: --secret on the command line is visible in `ps`; "
+              "prefer the GATEWAY_SECRET environment variable", file=sys.stderr)
 
     policy = load_policy(args.policy)
     providers: dict = {}

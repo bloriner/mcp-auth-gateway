@@ -45,12 +45,28 @@ class UpstreamError(Exception):
 
 
 class UpstreamPool:
-    """One persistent stdio subprocess per server_id, started lazily."""
+    """One persistent stdio subprocess per server_id, started lazily.
+
+    Each server has its own lock held for the whole write+read cycle:
+    stdio is a single request/response stream, so concurrent callers
+    would otherwise interleave writes and read each other's responses
+    (a cross-user data leak). The global lock only guards the
+    proc/lock registries, so different servers still run in parallel.
+    """
 
     def __init__(self, read_timeout: float = 30.0):
         self._procs: dict[str, subprocess.Popen] = {}
+        self._locks: dict[str, threading.Lock] = {}
         self._lock = threading.Lock()
         self._read_timeout = read_timeout
+
+    def _server_lock(self, server_id: str) -> threading.Lock:
+        with self._lock:
+            lock = self._locks.get(server_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._locks[server_id] = lock
+            return lock
 
     def _spawn(self, server_id: str, command: list) -> subprocess.Popen:
         try:
@@ -61,31 +77,34 @@ class UpstreamPool:
             raise UpstreamError("cannot start %s: %s" % (server_id, exc)) from exc
 
     def call(self, server_id: str, command: list, message: dict) -> dict:
-        with self._lock:
-            proc = self._procs.get(server_id)
-            if proc is None or proc.poll() is not None:
-                proc = self._spawn(server_id, command)
-                self._procs[server_id] = proc
-        line = json.dumps(message) + "\n"
-        try:
-            proc.stdin.write(line)
-            proc.stdin.flush()
-        except (BrokenPipeError, OSError):
+        with self._server_lock(server_id):
             with self._lock:
-                self._procs.pop(server_id, None)
-            raise UpstreamError("upstream %s died on write" % server_id)
-        rlist, _, _ = select.select([proc.stdout], [], [], self._read_timeout)
-        if not rlist:
-            raise UpstreamError("upstream %s timed out" % server_id)
-        out = proc.stdout.readline()
-        if not out:
-            with self._lock:
-                self._procs.pop(server_id, None)
-            raise UpstreamError("upstream %s closed stdout" % server_id)
-        try:
-            return json.loads(out)
-        except json.JSONDecodeError as exc:
-            raise UpstreamError("upstream %s returned bad JSON" % server_id) from exc
+                proc = self._procs.get(server_id)
+                if proc is None or proc.poll() is not None:
+                    proc = self._spawn(server_id, command)
+                    self._procs[server_id] = proc
+            line = json.dumps(message) + "\n"
+            try:
+                proc.stdin.write(line)
+                proc.stdin.flush()
+            except (BrokenPipeError, OSError):
+                with self._lock:
+                    self._procs.pop(server_id, None)
+                raise UpstreamError("upstream %s died on write" % server_id)
+            rlist, _, _ = select.select([proc.stdout], [], [],
+                                        self._read_timeout)
+            if not rlist:
+                raise UpstreamError("upstream %s timed out" % server_id)
+            out = proc.stdout.readline()
+            if not out:
+                with self._lock:
+                    self._procs.pop(server_id, None)
+                raise UpstreamError("upstream %s closed stdout" % server_id)
+            try:
+                return json.loads(out)
+            except json.JSONDecodeError as exc:
+                raise UpstreamError(
+                    "upstream %s returned bad JSON" % server_id) from exc
 
     def shutdown(self):
         with self._lock:
@@ -137,14 +156,23 @@ class Gateway:
         if len(parts) != 2:
             return None
         body, sig = parts
-        if not hmac.compare_digest(self._sign(body), sig):
+        try:
+            ok = hmac.compare_digest(self._sign(body), sig)
+        except TypeError:
+            # attacker-controlled sig bytes: fail closed, never 500
+            return None
+        if not ok:
             return None
         try:
             pad = "=" * (-len(body) % 4)
             payload = json.loads(base64.urlsafe_b64decode(body + pad))
         except Exception:
             return None
+        if not isinstance(payload, dict):
+            return None
         if payload.get("exp", 0) <= int(time.time()):
+            return None
+        if not isinstance(payload.get("sub"), str) or not payload["sub"]:
             return None
         return payload
 
@@ -168,6 +196,8 @@ class Gateway:
     # -- token minting -------------------------------------------------------
 
     def mint_for(self, user_login: str, server_id: str) -> tuple[str, list]:
+        if not isinstance(server_id, str) or not server_id:
+            raise PolicyError("invalid server id")
         scopes = self.policy.resolve_scopes(user_login, server_id)
         if not scopes:
             raise PolicyError("no access for %s on %s" % (user_login, server_id))
@@ -193,6 +223,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", "nosniff")
         for k, v in (headers or {}).items():
             self.send_header(k, v)
         self.end_headers()
@@ -265,10 +296,14 @@ class _Handler(BaseHTTPRequestHandler):
                                             "detail": str(exc)})
             session = gw.make_session(user)
             allowed = gw.policy.allowed_servers(user["login"])
+            cookie = ("mgw_session=%s; HttpOnly; SameSite=Lax; Path=/" % session)
+            if gw.base_url.lower().startswith("https://"):
+                # without Secure, a network attacker can steal the
+                # session cookie; only meaningful over HTTPS deploys
+                cookie += "; Secure"
             return self._send_json(200, {"login": user["login"],
                                          "servers": allowed},
-                                   {"Set-Cookie": "mgw_session=%s; HttpOnly; "
-                                                  "SameSite=Lax; Path=/" % session})
+                                   {"Set-Cookie": cookie})
 
         if path == "/health":
             return self._send_json(200, {"ok": True})
@@ -286,8 +321,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return self._send_json(401, {"error": "login required"})
             body = self._read_json_body()
             server_id = (body or {}).get("server")
-            if not server_id:
-                return self._send_json(400, {"error": "missing server"})
+            if not isinstance(server_id, str) or not server_id:
+                return self._send_json(400, {"error": "missing or invalid server"})
             try:
                 token, scopes = gw.mint_for(sess["sub"], server_id)
             except PolicyError as exc:
@@ -337,5 +372,11 @@ class _Handler(BaseHTTPRequestHandler):
 
 def serve(gateway: Gateway, host: str = "127.0.0.1", port: int = 8080):
     _Handler.gateway = gateway
-    server = ThreadingHTTPServer((host, port), _Handler)
-    return server
+
+    class _Server(ThreadingHTTPServer):
+        # the stdlib default backlog (5) RSTs clients under burst load;
+        # 128 lets bursts queue instead of failing
+        request_queue_size = 128
+        daemon_threads = True
+
+    return _Server((host, port), _Handler)
